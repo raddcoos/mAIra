@@ -58,7 +58,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     
     # Call the function from ai_brain.py
-    ai_reply = get_ai_response(user_text)
+    ai_reply = await get_ai_response(user_text)
     
     await update.message.reply_text(text=ai_reply)
 
