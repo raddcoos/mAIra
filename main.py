@@ -87,6 +87,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Execution error: {e}")
         await update.message.reply_text(f"⚠️ Failed to execute task: {e}")
+        
 # 4. Main application entry point
 def main():
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
