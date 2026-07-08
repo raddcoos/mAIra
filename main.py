@@ -15,6 +15,7 @@ from telegram.ext import (
 from supabase import create_client, Client
 from ai_brain import get_ai_response, rewrite_email
 from gmail_helper import send_gmail
+from contacts_insert import insert_command, handle_contact_insert
 
 # 1. Configure logging
 logging.basicConfig(
@@ -113,6 +114,12 @@ def format_preview(recipient_email: str, subject: str, body: str) -> str:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Passes natural language text to Gemini and intercepts action commands."""
+
+    # If the user is mid-way through /insert, route to that flow instead of the AI.
+    if context.user_data.get("awaiting_contact_insert"):
+        await handle_contact_insert(update, context, supabase)
+        return
+
     user_text = update.message.text
     # Prefer the fixed SENDER_NAME setting; fall back to Telegram's first name.
     sender_name = SENDER_NAME or update.effective_user.first_name
@@ -257,6 +264,7 @@ def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("contact", get_contact_command))
+    application.add_handler(CommandHandler("insert", insert_command))
     application.add_handler(CallbackQueryHandler(handle_email_confirmation))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
