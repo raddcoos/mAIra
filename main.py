@@ -13,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 from supabase import create_client, Client
-from ai_brain import get_ai_response
+from ai_brain import get_ai_response, rewrite_email
 from gmail_helper import send_gmail
 
 # 1. Configure logging
@@ -91,9 +91,19 @@ def build_confirmation_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("✅ Send", callback_data="confirm_send_email"),
+            InlineKeyboardButton("🔄 Rewrite", callback_data="rewrite_send_email"),
             InlineKeyboardButton("❌ Cancel", callback_data="cancel_send_email"),
         ]
     ])
+
+
+def format_preview(recipient_email: str, subject: str, body: str) -> str:
+    return (
+        f"Here's the email I'll send to *{recipient_email}*:\n\n"
+        f"*Subject:* {subject}\n\n"
+        f"{body}\n\n"
+        f"Send it?"
+    )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,22 +144,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(error)
                     return
 
-            # Stash the draft so the callback handler can send it after approval.
-            # Keyed per-user via context.user_data.
+            # Stash the draft so the callback handler can send/rewrite it after approval.
+            # Keyed per-user via context.user_data. original_request + sender_name are
+            # kept so the Rewrite button can ask Gemini for a fresh version later.
             context.user_data["pending_email"] = {
                 "to": recipient_email,
                 "subject": subject,
                 "body": body,
+                "original_request": user_text,
+                "sender_name": sender_name,
             }
 
-            preview = (
-                f"Here's the email I'll send to *{recipient_email}*:\n\n"
-                f"*Subject:* {subject}\n\n"
-                f"{body}\n\n"
-                f"Send it?"
-            )
             await update.message.reply_text(
-                preview,
+                format_preview(recipient_email, subject, body),
                 parse_mode="Markdown",
                 reply_markup=build_confirmation_keyboard(),
             )
@@ -165,7 +172,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_email_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the Send/Cancel button taps under an email preview."""
+    """Handles the Send / Rewrite / Cancel button taps under an email preview."""
     query = update.callback_query
     await query.answer()
 
@@ -176,11 +183,11 @@ async def handle_email_confirmation(update: Update, context: ContextTypes.DEFAUL
         await query.edit_message_text("❌ Cancelled. That email was not sent.")
         return
 
-    if query.data == "confirm_send_email":
-        if not pending:
-            await query.edit_message_text("⚠️ This draft has expired (e.g. the bot restarted). Please ask me again.")
-            return
+    if not pending:
+        await query.edit_message_text("⚠️ This draft has expired (e.g. the bot restarted). Please ask me again.")
+        return
 
+    if query.data == "confirm_send_email":
         try:
             send_gmail(pending["to"], pending["subject"], pending["body"])
             await query.edit_message_text(f"✅ Email sent successfully to {pending['to']}!")
@@ -189,6 +196,49 @@ async def handle_email_confirmation(update: Update, context: ContextTypes.DEFAUL
             await query.edit_message_text(f"⚠️ Failed to send: {e}")
         finally:
             context.user_data.pop("pending_email", None)
+        return
+
+    if query.data == "rewrite_send_email":
+        await query.edit_message_text("🔄 Rewriting the email...")
+
+        raw_reply = await rewrite_email(
+            original_request=pending["original_request"],
+            previous_subject=pending["subject"],
+            previous_body=pending["body"],
+            sender_name=pending.get("sender_name"),
+        )
+
+        if not raw_reply:
+            # Rewrite failed — restore the previous draft so it isn't lost.
+            await query.edit_message_text(
+                format_preview(pending["to"], pending["subject"], pending["body"]) +
+                "\n\n⚠️ (Rewrite failed, showing the previous draft again.)",
+                parse_mode="Markdown",
+                reply_markup=build_confirmation_keyboard(),
+            )
+            return
+
+        try:
+            match = re.search(r'\{.*\}', raw_reply, re.DOTALL)
+            json_string = match.group(0) if match else raw_reply
+            new_draft = json.loads(json_string)
+
+            pending["subject"] = new_draft.get("subject", pending["subject"])
+            pending["body"] = new_draft.get("body", pending["body"])
+            context.user_data["pending_email"] = pending
+
+            await query.edit_message_text(
+                format_preview(pending["to"], pending["subject"], pending["body"]),
+                parse_mode="Markdown",
+                reply_markup=build_confirmation_keyboard(),
+            )
+        except json.JSONDecodeError:
+            await query.edit_message_text(
+                format_preview(pending["to"], pending["subject"], pending["body"]) +
+                "\n\n⚠️ (Rewrite failed, showing the previous draft again.)",
+                parse_mode="Markdown",
+                reply_markup=build_confirmation_keyboard(),
+            )
 
 
 # 4. Main application entry point
