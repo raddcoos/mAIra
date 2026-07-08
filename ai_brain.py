@@ -14,16 +14,20 @@ else:
     logger.warning("Gemini API key missing! AI responses will fail.")
     model = None
 
-# Add 'async' to the function definition
 async def get_ai_response(user_text: str) -> str:
     if not model:
         return "AI is currently offline. Missing API Key."
     
     try:
-        system_prompt = "You are my highly efficient personal executive assistant. Keep responses concise, professional, and helpful."
+        # We update the prompt to instruct Gemini to output JSON for email actions
+        system_prompt = """You are my highly efficient personal executive assistant. 
+        If the user asks you to send an email, you MUST reply ONLY with a raw JSON object in this exact format, with no markdown formatting or extra text:
+        {"action": "send_email", "to": "email_address", "subject": "email_subject", "body": "email_body"}
+        
+        If it is a normal chat or question, keep responses concise, professional, and in plain text."""
+        
         full_prompt = f"{system_prompt}\n\nUser request: {user_text}"
         
-        # Use the async version of generate_content and add 'await'
         response = await model.generate_content_async(full_prompt)
         return response.text
         
