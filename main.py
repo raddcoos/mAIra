@@ -32,6 +32,11 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     supabase = None
 
+# The exact name to sign emails off with. Set this in Railway's Service Variables.
+# Falls back to the user's Telegram first name if not set, so the bot doesn't break
+# if you forget to configure it — but for a reliable, exact sign-off, set this.
+SENDER_NAME = os.getenv("SENDER_NAME")
+
 # 3. Core Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_first_name = update.effective_user.first_name
@@ -109,7 +114,8 @@ def format_preview(recipient_email: str, subject: str, body: str) -> str:
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Passes natural language text to Gemini and intercepts action commands."""
     user_text = update.message.text
-    sender_name = update.effective_user.first_name
+    # Prefer the fixed SENDER_NAME setting; fall back to Telegram's first name.
+    sender_name = SENDER_NAME or update.effective_user.first_name
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
 
