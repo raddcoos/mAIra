@@ -22,14 +22,23 @@ NO_PLACEHOLDER_RULES = """
 """
 
 
+def _sender_sign_off_rule(sender_name: str = None) -> str:
+    if sender_name:
+        # Verbatim instruction: the model must not shorten, abbreviate, or
+        # otherwise "improve" this string — copy it exactly as given.
+        return (
+            f'If a sign-off is appropriate, sign off using EXACTLY this text, unchanged, '
+            f'character for character: "{sender_name}". Do not shorten it, do not use only '
+            f'part of it (e.g. only a first name), do not change its capitalization.'
+        )
+    return "You don't know the sender's name — sign off without a name (e.g. just \"Best regards,\")."
+
+
 async def get_ai_response(user_text: str, sender_name: str = None) -> str:
     if not model:
         return "AI is currently offline. Missing API Key."
 
     try:
-        sender_line = f'The person you are writing on behalf of is named "{sender_name}".' if sender_name else \
-            "You don't know the sender's name."
-
         system_prompt = f"""You are my highly efficient personal executive assistant.
 
         If the user asks you to send an email, you MUST reply ONLY with a raw JSON object
@@ -45,9 +54,7 @@ async def get_ai_response(user_text: str, sender_name: str = None) -> str:
         - Write a short, sensible subject line if the user didn't give one.
         - Write a complete, natural, human-sounding email body that faithfully conveys
           what the user asked to say, using any specific details they gave (dates, places, etc.).
-        - {sender_line} If a sign-off is appropriate, use their first name naturally
-          (e.g. "Warmly, {sender_name or 'X'}"). If you don't know the sender's name, sign off
-          without a name (e.g. just "Warmly," or "Best regards,") rather than inventing one.
+        - {_sender_sign_off_rule(sender_name)}
         {NO_PLACEHOLDER_RULES}
 
         If it is a normal chat or question (not a request to send an email), keep responses
@@ -73,9 +80,6 @@ async def rewrite_email(original_request: str, previous_subject: str, previous_b
         return None
 
     try:
-        sender_line = f'The person you are writing on behalf of is named "{sender_name}".' if sender_name else \
-            "You don't know the sender's name."
-
         system_prompt = f"""You are my highly efficient personal executive assistant.
 
         The user already asked you to draft an email, and you wrote a first draft. They want
@@ -87,8 +91,7 @@ async def rewrite_email(original_request: str, previous_subject: str, previous_b
         {{"subject": "email_subject", "body": "email_body"}}
 
         Rules:
-        - {sender_line} If a sign-off is appropriate, use their first name naturally.
-          If you don't know the sender's name, sign off without a name.
+        - {_sender_sign_off_rule(sender_name)}
         {NO_PLACEHOLDER_RULES}
         - Do not simply reword a sentence or two — write a genuinely fresh draft."""
 
