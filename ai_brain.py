@@ -109,3 +109,24 @@ async def rewrite_email(original_request: str, previous_subject: str, previous_b
     except Exception as e:
         logger.error(f"Gemini API error during rewrite: {e}")
         return None
+
+
+async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
+    """
+    Transcribes a voice note to plain text using Gemini's native audio understanding.
+    Returns the transcript (str), or None if transcription failed.
+    """
+    if not model:
+        return None
+
+    try:
+        response = await model.generate_content_async([
+            {"mime_type": mime_type, "data": bytes(audio_bytes)},
+            "Transcribe this audio to plain text, in the language it was spoken in. "
+            "Output ONLY the transcription itself — no quotation marks, no commentary, "
+            "no labels like 'Transcript:'.",
+        ])
+        return response.text.strip()
+    except Exception as e:
+        logger.error(f"Gemini transcription error: {e}")
+        return None
