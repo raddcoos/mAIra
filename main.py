@@ -13,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 from supabase import create_client, Client
-from ai_brain import get_ai_response, rewrite_email
+from ai_brain import get_ai_response, rewrite_email, transcribe_audio
 from gmail_helper import send_gmail
 from contacts_insert import insert_command, handle_contact_insert
 
@@ -112,15 +112,17 @@ def format_preview(recipient_email: str, subject: str, body: str) -> str:
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Passes natural language text to Gemini and intercepts action commands."""
-
+async def process_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
+    """
+    Core command-handling logic, shared by typed messages and transcribed voice
+    messages. Whatever text comes in here is treated identically regardless of
+    whether it was typed or spoken.
+    """
     # If the user is mid-way through /insert, route to that flow instead of the AI.
     if context.user_data.get("awaiting_contact_insert"):
         await handle_contact_insert(update, context, supabase)
         return
 
-    user_text = update.message.text
     # Prefer the fixed SENDER_NAME setting; fall back to Telegram's first name.
     sender_name = SENDER_NAME or update.effective_user.first_name
 
@@ -182,6 +184,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Execution error: {e}")
         await update.message.reply_text(f"⚠️ Failed to execute task: {e}")
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for typed text messages."""
+    await process_text_command(update, context, update.message.text)
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Entry point for voice notes. Downloads the audio, transcribes it via Gemini,
+    then runs it through the exact same pipeline as a typed message.
+    """
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
+
+    voice = update.message.voice
+    if not voice:
+        return
+
+    try:
+        telegram_file = await context.bot.get_file(voice.file_id)
+        audio_bytes = await telegram_file.download_as_bytearray()
+    except Exception as e:
+        logger.error(f"Failed to download voice note: {e}")
+        await update.message.reply_text("⚠️ I couldn't download that voice message. Please try again.")
+        return
+
+    mime_type = voice.mime_type or "audio/ogg"
+    transcript = await transcribe_audio(audio_bytes, mime_type=mime_type)
+
+    if not transcript:
+        await update.message.reply_text(
+            "⚠️ Sorry, I couldn't understand that voice message. Please try again or type your command instead."
+        )
+        return
+
+    await update.message.reply_text(f"🎙️ Heard: \"{transcript}\"")
+    await process_text_command(update, context, transcript)
 
 
 async def handle_email_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,6 +305,7 @@ def main():
     application.add_handler(CommandHandler("contact", get_contact_command))
     application.add_handler(CommandHandler("insert", insert_command))
     application.add_handler(CallbackQueryHandler(handle_email_confirmation))
+    application.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Starting Telegram bot polling...")
