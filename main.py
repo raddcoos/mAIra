@@ -3,8 +3,15 @@ import os
 import logging
 import json
 import re
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 from supabase import create_client, Client
 from ai_brain import get_ai_response
 from gmail_helper import send_gmail
@@ -80,13 +87,23 @@ def resolve_contact_email(name: str):
     return email, None
 
 
+def build_confirmation_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Send", callback_data="confirm_send_email"),
+            InlineKeyboardButton("❌ Cancel", callback_data="cancel_send_email"),
+        ]
+    ])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Passes natural language text to Gemini and intercepts action commands."""
     user_text = update.message.text
+    sender_name = update.effective_user.first_name
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
 
-    ai_reply = await get_ai_response(user_text)
+    ai_reply = await get_ai_response(user_text, sender_name=sender_name)
 
     try:
         # Use Regex to hunt down the JSON object anywhere in the text
@@ -117,9 +134,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(error)
                     return
 
-            await update.message.reply_text(f"📧 Drafting and sending email to {recipient_email}...")
-            send_gmail(recipient_email, subject, body)
-            await update.message.reply_text(f"✅ Email sent successfully to {recipient_email}!")
+            # Stash the draft so the callback handler can send it after approval.
+            # Keyed per-user via context.user_data.
+            context.user_data["pending_email"] = {
+                "to": recipient_email,
+                "subject": subject,
+                "body": body,
+            }
+
+            preview = (
+                f"Here's the email I'll send to *{recipient_email}*:\n\n"
+                f"*Subject:* {subject}\n\n"
+                f"{body}\n\n"
+                f"Send it?"
+            )
+            await update.message.reply_text(
+                preview,
+                parse_mode="Markdown",
+                reply_markup=build_confirmation_keyboard(),
+            )
         else:
             await update.message.reply_text(ai_reply)
 
@@ -129,6 +162,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Execution error: {e}")
         await update.message.reply_text(f"⚠️ Failed to execute task: {e}")
+
+
+async def handle_email_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the Send/Cancel button taps under an email preview."""
+    query = update.callback_query
+    await query.answer()
+
+    pending = context.user_data.get("pending_email")
+
+    if query.data == "cancel_send_email":
+        context.user_data.pop("pending_email", None)
+        await query.edit_message_text("❌ Cancelled. That email was not sent.")
+        return
+
+    if query.data == "confirm_send_email":
+        if not pending:
+            await query.edit_message_text("⚠️ This draft has expired (e.g. the bot restarted). Please ask me again.")
+            return
+
+        try:
+            send_gmail(pending["to"], pending["subject"], pending["body"])
+            await query.edit_message_text(f"✅ Email sent successfully to {pending['to']}!")
+        except Exception as e:
+            logger.error(f"Failed to send confirmed email: {e}")
+            await query.edit_message_text(f"⚠️ Failed to send: {e}")
+        finally:
+            context.user_data.pop("pending_email", None)
+
 
 # 4. Main application entry point
 def main():
@@ -140,6 +201,7 @@ def main():
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("contact", get_contact_command))
+    application.add_handler(CallbackQueryHandler(handle_email_confirmation))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Starting Telegram bot polling...")
