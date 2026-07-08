@@ -2,6 +2,7 @@
 import os
 import logging
 import json
+import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from supabase import create_client, Client
@@ -60,30 +61,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     ai_reply = await get_ai_response(user_text)
     
-    # Try to parse the AI response as a JSON action
     try:
-        # Strip potential markdown formatting (```json ... ```) that LLMs sometimes add
-        clean_reply = ai_reply.strip().strip("`").removeprefix("json").strip()
-        data = json.loads(clean_reply)
+        # Use Regex to hunt down the JSON object anywhere in the text
+        json_string = ai_reply
+        match = re.search(r'\{.*\}', ai_reply, re.DOTALL)
+        if match:
+            json_string = match.group(0)
+            
+        # Try to parse the extracted string
+        data = json.loads(json_string)
         
         if data.get("action") == "send_email":
             await update.message.reply_text("📧 Drafting and sending email...")
             
             # Execute the function from gmail_helper.py
-            send_gmail(data["to"], data["subject"], data["body"])
+            send_gmail(data["to"], data["subject"], data.get("body", ""))
             
             await update.message.reply_text(f"✅ Email sent successfully to {data['to']}!")
         else:
-            # If it's JSON but not an email action, just print it
             await update.message.reply_text(ai_reply)
             
     except json.JSONDecodeError:
-        # If it fails to parse as JSON, it's just normal text chat. Reply normally.
+        # If no valid JSON is found, treat it as normal text chat
         await update.message.reply_text(text=ai_reply)
     except Exception as e:
         logger.error(f"Execution error: {e}")
         await update.message.reply_text(f"⚠️ Failed to execute task: {e}")
-
 # 4. Main application entry point
 def main():
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
