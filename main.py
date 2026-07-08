@@ -1,10 +1,12 @@
 # main.py
 import os
 import logging
+import json
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from supabase import create_client, Client
 from ai_brain import get_ai_response
+from gmail_helper import send_gmail
 
 # 1. Configure logging
 logging.basicConfig(
@@ -51,16 +53,36 @@ async def get_contact_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⚠️ An error occurred while searching the database.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Passes natural language text to the separated Gemini module."""
+    """Passes natural language text to Gemini and intercepts action commands."""
     user_text = update.message.text
 
-    # Show a "typing..." action in Telegram so you know it's thinking
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
     
-    # Call the function from ai_brain.py
     ai_reply = await get_ai_response(user_text)
     
-    await update.message.reply_text(text=ai_reply)
+    # Try to parse the AI response as a JSON action
+    try:
+        # Strip potential markdown formatting (```json ... ```) that LLMs sometimes add
+        clean_reply = ai_reply.strip().strip("`").removeprefix("json").strip()
+        data = json.loads(clean_reply)
+        
+        if data.get("action") == "send_email":
+            await update.message.reply_text("📧 Drafting and sending email...")
+            
+            # Execute the function from gmail_helper.py
+            send_gmail(data["to"], data["subject"], data["body"])
+            
+            await update.message.reply_text(f"✅ Email sent successfully to {data['to']}!")
+        else:
+            # If it's JSON but not an email action, just print it
+            await update.message.reply_text(ai_reply)
+            
+    except json.JSONDecodeError:
+        # If it fails to parse as JSON, it's just normal text chat. Reply normally.
+        await update.message.reply_text(text=ai_reply)
+    except Exception as e:
+        logger.error(f"Execution error: {e}")
+        await update.message.reply_text(f"⚠️ Failed to execute task: {e}")
 
 # 4. Main application entry point
 def main():
