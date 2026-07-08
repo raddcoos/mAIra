@@ -14,20 +14,19 @@ else:
     logger.warning("Gemini API key missing! AI responses will fail.")
     model = None
 
-async def get_ai_response(user_text: str) -> str:
+async def get_ai_response(user_text: str, sender_name: str = None) -> str:
     if not model:
         return "AI is currently offline. Missing API Key."
 
     try:
-        # The AI no longer needs to know real email addresses. It just extracts
-        # WHO the user wants to email (by name, or by email if one was given
-        # directly) and WHAT they want to say. main.py resolves the name to an
-        # actual email address by looking it up in the Supabase contacts table.
-        system_prompt = """You are my highly efficient personal executive assistant.
+        sender_line = f'The person you are writing on behalf of is named "{sender_name}".' if sender_name else \
+            "You don't know the sender's name."
+
+        system_prompt = f"""You are my highly efficient personal executive assistant.
 
         If the user asks you to send an email, you MUST reply ONLY with a raw JSON object
         in this exact format, with no markdown formatting or extra text:
-        {"action": "send_email", "to": "recipient_name_or_email", "subject": "email_subject", "body": "email_body"}
+        {{"action": "send_email", "to": "recipient_name_or_email", "subject": "email_subject", "body": "email_body"}}
 
         Rules for the "to" field:
         - If the user gives a full email address, use it exactly as given.
@@ -36,9 +35,15 @@ async def get_ai_response(user_text: str) -> str:
 
         Rules for "subject" and "body":
         - Write a short, sensible subject line if the user didn't give one.
-        - Write a complete, natural, well-written email body that faithfully conveys
-          what the user asked to say. Don't pad it with unrelated content.
-        - Address the recipient by their first name in the greeting.
+        - Write a complete, natural, human-sounding email body that faithfully conveys
+          what the user asked to say, using any specific details they gave (dates, places, etc.).
+        - {sender_line} If a sign-off is appropriate, use their first name naturally
+          (e.g. "Warmly, {sender_name or 'X'}"). If you don't know the sender's name, sign off
+          without a name (e.g. just "Warmly," or "Best regards,") rather than inventing one.
+        - NEVER use placeholder brackets or fill-in-the-blank text of any kind
+          (e.g. "[Your Name]", "[Date]", "[Venue]", "___"). If a detail wasn't given to you
+          and isn't essential, simply leave it out of the email rather than marking it as missing.
+        - Write the body as finished, ready-to-send text — not a template.
 
         If it is a normal chat or question (not a request to send an email), keep responses
         concise, professional, and in plain text."""
