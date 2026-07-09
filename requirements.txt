@@ -2,3 +2,4 @@ python-telegram-bot==21.10
 supabase
 google-generativeai
 requests
+httpx
