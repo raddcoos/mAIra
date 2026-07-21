@@ -24,6 +24,16 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "20"))
 
+# Base URL of the tunnel pointing at your PC's local Whisper server
+# (whisper_server.py), e.g. "https://your-whisper-tunnel.trycloudflare.com".
+WHISPER_URL = os.getenv("WHISPER_URL", "").rstrip("/")
+WHISPER_TIMEOUT = float(os.getenv("WHISPER_TIMEOUT_SECONDS", "30"))
+
+# When true, appends a small "(via ollama)" / "(via gemini)" tag to plain chat
+# replies (never to the send_email JSON) so you can visually confirm which
+# engine answered, without having to check Railway logs.
+DEBUG_AI_SOURCE = os.getenv("DEBUG_AI_SOURCE", "false").lower() == "true"
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-2.5-flash')
@@ -89,10 +99,9 @@ async def _call_gemini(system_prompt: str, user_text: str) -> str:
     return response.text
 
 
-async def _run_with_fallback(system_prompt: str, user_text: str) -> str:
+async def _run_with_fallback(system_prompt: str, user_text: str) -> tuple[str, str]:
     """Tries the primary engine, automatically falls back to the other one on
-    failure. Returns the raw text response, or a user-facing error string if
-    both engines fail."""
+    failure. Returns (text, engine_used). engine_used is "error" if both fail."""
     engines = ["ollama", "gemini"] if PRIMARY_AI == "ollama" else ["gemini", "ollama"]
 
     last_error = None
@@ -103,14 +112,30 @@ async def _run_with_fallback(system_prompt: str, user_text: str) -> str:
             else:
                 text = await _call_gemini(system_prompt, user_text)
             logger.info(f"AI response served by: {engine}")
-            return text
+            return text, engine
         except Exception as e:
             logger.warning(f"{engine} failed: {e}")
             last_error = e
             continue
 
     logger.error(f"All AI engines failed. Last error: {last_error}")
-    return f"⚠️ Sorry, I encountered an error: {last_error}"
+    return f"⚠️ Sorry, I encountered an error: {last_error}", "error"
+
+
+def _maybe_tag_source(text: str, engine: str) -> str:
+    """Appends a debug tag like '(via ollama)' to plain-text replies when
+    DEBUG_AI_SOURCE is enabled. Never tags JSON (send_email actions), since
+    that would break the caller's parsing."""
+    if not DEBUG_AI_SOURCE or engine == "error":
+        return text
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            json.loads(stripped)
+            return text  # it's valid JSON (a send_email action) — don't touch it
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return f"{text}\n\n_(via {engine})_"
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +164,8 @@ async def get_ai_response(user_text: str, sender_name: str = None) -> str:
     If it is a normal chat or question (not a request to send an email), keep responses
     concise, professional, and in plain text."""
 
-    return await _run_with_fallback(system_prompt, user_text)
+    text, engine = await _run_with_fallback(system_prompt, user_text)
+    return _maybe_tag_source(text, engine)
 
 
 async def rewrite_email(original_request: str, previous_subject: str, previous_body: str, sender_name: str = None) -> str:
@@ -171,33 +197,73 @@ async def rewrite_email(original_request: str, previous_subject: str, previous_b
     )
 
     try:
-        return await _run_with_fallback(system_prompt, user_text)
+        text, engine = await _run_with_fallback(system_prompt, user_text)
+        if engine == "error":
+            return None
+        return _maybe_tag_source(text, engine)
     except Exception as e:
         logger.error(f"rewrite_email error: {e}")
         return None
 
 
+async def _call_local_whisper(audio_bytes: bytes, mime_type: str) -> str:
+    """Calls your local whisper_server.py (via tunnel). Raises on any failure
+    so the caller can fall back to Gemini."""
+    if not WHISPER_URL:
+        raise RuntimeError("WHISPER_URL is not set")
+
+    ext = mime_type.split("/")[-1] if "/" in mime_type else "ogg"
+    files = {"file": (f"audio.{ext}", audio_bytes, mime_type)}
+
+    async with httpx.AsyncClient(timeout=WHISPER_TIMEOUT) as client:
+        resp = await client.post(f"{WHISPER_URL}/transcribe", files=files)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if "error" in data:
+        raise RuntimeError(f"Whisper server error: {data['error']}")
+
+    text = data.get("text", "")
+    if not text:
+        raise RuntimeError(f"Whisper server returned an empty transcript: {data}")
+    return text.strip()
+
+
+async def _call_gemini_transcription(audio_bytes: bytes, mime_type: str) -> str:
+    if not gemini_model:
+        raise RuntimeError("Gemini model is not configured (missing API key)")
+
+    response = await gemini_model.generate_content_async([
+        {"mime_type": mime_type, "data": bytes(audio_bytes)},
+        "Transcribe this audio to plain text, in the language it was spoken in. "
+        "Output ONLY the transcription itself — no quotation marks, no commentary, "
+        "no labels like 'Transcript:'.",
+    ])
+    return response.text.strip()
+
+
 async def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/ogg") -> str:
     """
-    Transcribes a voice note to plain text using Gemini's native audio understanding.
-
-    NOTE: This stays on Gemini regardless of PRIMARY_AI. qwen3.5 (like most local
-    Ollama models) does not accept raw audio input the way Gemini does, so there is
-    no local equivalent here without adding a separate speech-to-text tool (e.g.
-    faster-whisper running locally). Ask if you'd like that added instead — it would
-    make transcription free too, just like the text responses.
+    Transcribes a voice note to plain text. Tries your local Whisper server first
+    (free, via tunnel), and automatically falls back to Gemini's native audio
+    understanding if Whisper is unreachable. Returns the transcript, or None if
+    both fail.
     """
-    if not gemini_model:
-        return None
+    engines = ["whisper", "gemini"] if PRIMARY_AI == "ollama" else ["gemini", "whisper"]
 
-    try:
-        response = await gemini_model.generate_content_async([
-            {"mime_type": mime_type, "data": bytes(audio_bytes)},
-            "Transcribe this audio to plain text, in the language it was spoken in. "
-            "Output ONLY the transcription itself — no quotation marks, no commentary, "
-            "no labels like 'Transcript:'.",
-        ])
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"Gemini transcription error: {e}")
-        return None
+    last_error = None
+    for engine in engines:
+        try:
+            if engine == "whisper":
+                text = await _call_local_whisper(audio_bytes, mime_type)
+            else:
+                text = await _call_gemini_transcription(audio_bytes, mime_type)
+            logger.info(f"Transcription served by: {engine}")
+            return text
+        except Exception as e:
+            logger.warning(f"{engine} transcription failed: {e}")
+            last_error = e
+            continue
+
+    logger.error(f"All transcription engines failed. Last error: {last_error}")
+    return None
